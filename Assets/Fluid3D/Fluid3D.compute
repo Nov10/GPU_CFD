@@ -1,0 +1,239 @@
+#pragma kernel Initialize
+#pragma kernel Diffuse
+#pragma kernel Advect
+#pragma kernel UserInput
+#pragma kernel Divergence
+#pragma kernel Jacobi
+#pragma kernel SubtractGradient
+
+
+RWTexture3D<float3> VelocityTex;
+RWTexture3D<float4> DensityTex; //r,g,b is dye color, a is density
+RWTexture3D<float> PressureTex;
+RWTexture3D<float> DivergenceTex;
+RWTexture3D<int> ObstacleTexture;
+
+uint size; //texture resolution
+float3 spherePos;
+float3 sphereVelocity;
+float forceIntensity;
+float forceRange;
+float DeltaTime;
+float3 dyeColor;
+
+
+//Neighbour pixel offsets: top,bottom,left,right
+#define OffsetUp int3(0,1,0);
+#define OffsetBack int3(0,-1,0);
+#define OffsetLeft int3(-1,0,0);
+#define OffsetRight int3(1,0,0);
+#define OffsetFront int3(0,0,1);
+#define OffsetDown int3(0,0,-1);
+
+float3 LinearInterpolation3D(float3 a, float3 b, float t)
+{
+    return lerp(a, b, t);
+}
+
+float GetObstacle(int3 id) // 0 is obstacle, 1 is fluid
+{
+    float obstacle = 1;
+    float padding = 5.0;
+    float volumeSize = size - padding;
+    if (
+		id.x < padding || id.y < padding || id.z < padding ||
+		id.x > volumeSize || id.y > volumeSize || id.z > volumeSize)
+    {
+        obstacle = 0;
+    }
+    return obstacle * ObstacleTexture[id];
+}
+
+[numthreads(8, 8, 8)]
+void Initialize(uint3 id : SV_DispatchThreadid)
+{
+    DensityTex[id] = 0;
+    VelocityTex[id] = 0;
+    PressureTex[id] = 0;
+    DivergenceTex[id] = 0;
+}
+
+[numthreads(8, 8, 8)]
+void Diffuse(uint3 id : SV_DispatchThreadid)
+{
+    int3 idx = id;
+    int3 idxFront = idx + OffsetFront;
+    int3 idxBack = idx + OffsetBack;
+    int3 idxRight = idx + OffsetRight;
+    int3 idxLeft = idx + OffsetLeft;
+    int3 idxUp = idx + OffsetUp;
+    int3 idxDown = idx + OffsetDown;
+    
+    float obstacle = GetObstacle(idx);
+    float obstacleFront = GetObstacle(idxFront);
+    float obstacleBack = GetObstacle(idxBack);
+    float obstacleRight = GetObstacle(idxRight);
+    float obstacleLeft = GetObstacle(idxLeft);
+    float obstacleUp = GetObstacle(idxUp);
+    float obstacleDown = GetObstacle(idxDown);
+    
+    float4 density = DensityTex[idx];
+    float4 densityFront = DensityTex[idxFront] * obstacleFront;
+    float4 densityBack = DensityTex[idxBack] * obstacleBack;
+    float4 densityRight = DensityTex[idxRight] * obstacleRight;
+    float4 densityLeft = DensityTex[idxLeft] * obstacleLeft;
+    float4 densityUp = DensityTex[idxUp] * obstacleUp;
+    float4 densityDown = DensityTex[idxDown] * obstacleDown;
+    
+    float k = size * DeltaTime;
+    
+    float4 d = (density + k * (densityFront + densityBack + densityRight + densityLeft + densityUp + densityDown)) / (1 + 6.0 * k);
+    d = d * obstacle;
+    
+    DensityTex[idx] = d;
+}
+
+[numthreads(8, 8, 8)]
+void Advect(uint3 id : SV_DispatchThreadid)
+{
+    float3 velocity = VelocityTex[id].xyz;
+    float obstacle = GetObstacle(id);
+    
+    float3 densitySourcePosition = velocity * DeltaTime * size;
+    int3 densitySourceIdx = round(float3(id) - densitySourcePosition);
+    
+    float4 density = DensityTex[id];
+    float4 densitySource = DensityTex[densitySourceIdx];
+    density.a = 0.999 * densitySource.z * obstacle;
+    
+    density = LinearInterpolation3D(density.xyz, densitySource.xyz, 0.8f);
+    DensityTex[id] = density;
+    
+    VelocityTex[id] = 0.99f * VelocityTex[densitySourceIdx] * obstacle;
+}
+
+[numthreads(8, 8, 8)]
+void UserInput(uint3 id : SV_DispatchThreadid)
+{
+    float3 center = 0.5;
+    float3 uv = float3(id) / float(size);
+    float3 sphereUV = (spherePos + center);
+
+    float3 velocity = VelocityTex[id].xyz;
+    float4 density = DensityTex[id];
+    float obstacle = GetObstacle(id);
+    
+    float distance = distance(uv, sphereUV);
+    distance = 1.0 - smoothstep(distance, 0.0, forceRange);
+    float impulse = forceIntensity * distance * DeltaTime * obstacle;
+    
+    float speed = distance(sphereVelocity, 0);
+    density.a += impulse * speed;
+    
+    density.rgb = LinearInterpolation3D(density.rgb, dyeColor, impulse * speed);
+    float3 cdir = uv - center;
+    velocity += DeltaTime * density.a * cdir * forceIntensity;
+    
+    float3 dir = sphereVelocity;
+    velocity += dir * impulse * size * 0.5;
+    
+    VelocityTex[id] = float3(velocity);
+    DensityTex[id] = density;
+}
+
+[numthreads(8, 8, 8)]
+void Divergence(uint3 id : SV_DispatchThreadid)
+{
+    int3 idx = id;
+    int3 idxFront = idx + OffsetFront;
+    int3 idxBack = idx + OffsetBack;
+    int3 idxRight = idx + OffsetRight;
+    int3 idxLeft = idx + OffsetLeft;
+    int3 idxUp = idx + OffsetUp;
+    int3 idxDown = idx + OffsetDown;
+    
+    float obstacle = GetObstacle(idx);
+    float obstacleFront = GetObstacle(idxFront);
+    float obstacleBack = GetObstacle(idxBack);
+    float obstacleRight = GetObstacle(idxRight);
+    float obstacleLeft = GetObstacle(idxLeft);
+    float obstacleUp = GetObstacle(idxUp);
+    float obstacleDown = GetObstacle(idxDown);
+    float4 velocity = VelocityTex[idx];
+    float4 velocityFront = VelocityTex[idxFront] * obstacleFront;
+    float4 velocityBack = VelocityTex[idxBack] * obstacleBack;
+    float4 velocityRight = VelocityTex[idxRight] * obstacleRight;
+    float4 velocityLeft = VelocityTex[idxLeft] * obstacleLeft;
+    float4 velocityUp = VelocityTex[idxUp] * obstacleUp;
+    float4 velocityDown = VelocityTex[idxDown] * obstacleDown;
+    
+    float halfSize = (1.0 / 2 * float(size));
+    float divergence = halfSize * (velocityRight.x - velocityLeft.x + velocityUp.y - velocityDown.y + velocityFront.z - velocityBack.z);
+    DivergenceTex[id] = divergence;
+}
+
+[numthreads(8, 8, 8)]
+void Jacobi(uint3 id : SV_DispatchThreadid)
+{
+    int3 idx = id;
+    int3 idxFront = idx + OffsetFront;
+    int3 idxBack = idx + OffsetBack;
+    int3 idxRight = idx + OffsetRight;
+    int3 idxLeft = idx + OffsetLeft;
+    int3 idxUp = idx + OffsetUp;
+    int3 idxDown = idx + OffsetDown;
+    
+    float obstacle = GetObstacle(idx);
+    float obstacleFront = GetObstacle(idxFront);
+    float obstacleBack = GetObstacle(idxBack);
+    float obstacleRight = GetObstacle(idxRight);
+    float obstacleLeft = GetObstacle(idxLeft);
+    float obstacleUp = GetObstacle(idxUp);
+    float obstacleDown = GetObstacle(idxDown);
+    
+    float pressure = PressureTex[idx];
+    float pressureFront = lerp(pressure, PressureTex[idxFront], obstacleFront);
+    float pressureBack = lerp(pressure, PressureTex[idxBack], obstacleBack);
+    float pressureRight = lerp(pressure, PressureTex[idxRight], obstacleRight);
+    float pressureLeft = lerp(pressure, PressureTex[idxLeft], obstacleLeft);
+    float pressureUp = lerp(pressure, PressureTex[idxUp], obstacleUp);
+    float pressureDown = lerp(pressure, PressureTex[idxDown], obstacleDown);
+    
+    float divergence = DivergenceTex[id] * size;
+    float p = (pressureFront + pressureBack + pressureRight + pressureLeft + pressureUp + pressureDown - divergence) / 6.0;
+    PressureTex[id] = p;
+}
+
+[numthreads(8, 8, 8)]
+void SubtractGradient(uint3 id : SV_DispatchThreadid)
+{
+    int3 idx = id;
+    int3 idxFront = idx + OffsetFront;
+    int3 idxBack = idx + OffsetBack;
+    int3 idxRight = idx + OffsetRight;
+    int3 idxLeft = idx + OffsetLeft;
+    int3 idxUp = idx + OffsetUp;
+    int3 idxDown = idx + OffsetDown;
+    
+    float obstacle = GetObstacle(idx);
+    float obstacleFront = GetObstacle(idxFront);
+    float obstacleBack = GetObstacle(idxBack);
+    float obstacleRight = GetObstacle(idxRight);
+    float obstacleLeft = GetObstacle(idxLeft);
+    float obstacleUp = GetObstacle(idxUp);
+    float obstacleDown = GetObstacle(idxDown);
+    
+    float pressure = PressureTex[idx];
+    float pressureFront = lerp(pressure, PressureTex[idxFront], obstacleFront);
+    float pressureBack = lerp(pressure, PressureTex[idxBack], obstacleBack);
+    float pressureRight = lerp(pressure, PressureTex[idxRight], obstacleRight);
+    float pressureLeft = lerp(pressure, PressureTex[idxLeft], obstacleLeft);
+    float pressureUp = lerp(pressure, PressureTex[idxUp], obstacleUp);
+    float pressureDown = lerp(pressure, PressureTex[idxDown], obstacleDown);
+    
+    float3 velocity = VelocityTex[id];
+    float curlSize = 0.5;
+    float3 gradient = float3(pressureRight - pressureLeft, pressureUp - pressureDown, pressureFront - pressureBack) * curlSize;
+    velocity -= gradient;
+    VelocityTex[id] = float3(velocity);
+}
